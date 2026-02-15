@@ -33,6 +33,10 @@ const int PIN_CLK = 2;  // interrupt
 const int PIN_DT  = 3;
 const int PIN_SW  = 4;
 
+// Ultrasonic (HC-SR04)
+const int US_TRIG = 12;
+const int US_ECHO = A1;
+
 // ---------------- EEPROM addresses ----------------
 const int EE_H  = 0;
 const int EE_M  = 1;
@@ -54,8 +58,11 @@ long lastTriggeredMinuteKey = -1;
 
 // ---------------- Timers ----------------
 unsigned long lastDraw = 0;
-
 unsigned long moveUntil = 0;
+
+// Ultrasonic timing + value
+unsigned long lastDistMs = 0;
+float lastDistCm = -1;
 
 // ---------------- Button handling ----------------
 bool btnDown = false;
@@ -67,10 +74,10 @@ const unsigned long DEBOUNCE_MS = 40;
 
 // ---------------- Improved Alarm Sound Pattern ----------------
 // Pattern: beep 120ms, gap 80ms, beep 120ms, pause 500ms, repeat.
-const unsigned long BEEP_ON_MS   = 120;
-const unsigned long BEEP_GAP_MS  = 80;
-const unsigned long BEEP_ON2_MS  = 120;
-const unsigned long BEEP_PAUSE_MS= 500;
+const unsigned long BEEP_ON_MS    = 120;
+const unsigned long BEEP_GAP_MS   = 80;
+const unsigned long BEEP_ON2_MS   = 120;
+const unsigned long BEEP_PAUSE_MS = 500;
 
 unsigned long beepPhaseStarted = 0;
 int beepPhase = 0; // 0=on1,1=gap,2=on2,3=pause
@@ -84,7 +91,7 @@ void buzzerOff() {
 
 void buzzerOn() {
   if (ACTIVE_BUZZER) digitalWrite(PIN_BUZZER, HIGH);
-  else tone(PIN_BUZZER, 2200); // ringy high pitch
+  else tone(PIN_BUZZER, 2200);
   beepOn = true;
 }
 
@@ -95,36 +102,18 @@ void resetBeepPattern() {
 }
 
 void updateBeepPattern(unsigned long ms) {
-  // Called only in RINGING state
   switch (beepPhase) {
-    case 0: // on1
-      if (ms - beepPhaseStarted >= BEEP_ON_MS) {
-        buzzerOff();
-        beepPhase = 1;
-        beepPhaseStarted = ms;
-      }
+    case 0:
+      if (ms - beepPhaseStarted >= BEEP_ON_MS) { buzzerOff(); beepPhase = 1; beepPhaseStarted = ms; }
       break;
-    case 1: // gap
-      if (ms - beepPhaseStarted >= BEEP_GAP_MS) {
-        buzzerOn();
-        beepPhase = 2;
-        beepPhaseStarted = ms;
-      }
+    case 1:
+      if (ms - beepPhaseStarted >= BEEP_GAP_MS) { buzzerOn();  beepPhase = 2; beepPhaseStarted = ms; }
       break;
-    case 2: // on2
-      if (ms - beepPhaseStarted >= BEEP_ON2_MS) {
-        buzzerOff();
-        beepPhase = 3;
-        beepPhaseStarted = ms;
-      }
+    case 2:
+      if (ms - beepPhaseStarted >= BEEP_ON2_MS) { buzzerOff(); beepPhase = 3; beepPhaseStarted = ms; }
       break;
-    case 3: // pause
-      if (ms - beepPhaseStarted >= BEEP_PAUSE_MS) {
-        // restart
-        beepPhase = 0;
-        beepPhaseStarted = ms;
-        buzzerOn();
-      }
+    case 3:
+      if (ms - beepPhaseStarted >= BEEP_PAUSE_MS) { beepPhase = 0; beepPhaseStarted = ms; buzzerOn(); }
       break;
   }
 }
@@ -160,17 +149,17 @@ void motorsStop() {
 
 void setMotorA(int speed) {
   speed = constrain(speed, -255, 255);
-  if (speed > 0) { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW); }
-  else if (speed < 0) { digitalWrite(AIN1, LOW); digitalWrite(AIN2, HIGH); }
-  else { digitalWrite(AIN1, LOW); digitalWrite(AIN2, LOW); }
+  if (speed > 0)      { digitalWrite(AIN1, HIGH); digitalWrite(AIN2, LOW); }
+  else if (speed < 0) { digitalWrite(AIN1, LOW);  digitalWrite(AIN2, HIGH); }
+  else                { digitalWrite(AIN1, LOW);  digitalWrite(AIN2, LOW); }
   analogWrite(PWMA, abs(speed));
 }
 
 void setMotorB(int speed) {
   speed = constrain(speed, -255, 255);
-  if (speed > 0) { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW); }
-  else if (speed < 0) { digitalWrite(BIN1, LOW); digitalWrite(BIN2, HIGH); }
-  else { digitalWrite(BIN1, LOW); digitalWrite(BIN2, LOW); }
+  if (speed > 0)      { digitalWrite(BIN1, HIGH); digitalWrite(BIN2, LOW); }
+  else if (speed < 0) { digitalWrite(BIN1, LOW);  digitalWrite(BIN2, HIGH); }
+  else                { digitalWrite(BIN1, LOW);  digitalWrite(BIN2, LOW); }
   analogWrite(PWMB, abs(speed));
 }
 
@@ -203,6 +192,39 @@ void pickNextMove() {
   moveUntil = millis() + duration;
 }
 
+// ---- Ultrasonic ----
+float readDistanceCM() {
+  // Trigger pulse
+  digitalWrite(US_TRIG, LOW);
+  delayMicroseconds(2);
+  digitalWrite(US_TRIG, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(US_TRIG, LOW);
+
+  // Measure echo (timeout 25ms ~ 4m)
+  unsigned long duration = pulseIn(US_ECHO, HIGH, 25000UL);
+  if (duration == 0) return -1;           // no echo
+  return duration / 58.0f;                // cm
+}
+
+// Obstacle avoidance: reverse then turn
+void avoidObstacle() {
+  const int base = 220;
+  const int turn = 200;
+
+  // reverse briefly
+  drive(-base, -base);
+  delay(180); // short + effective
+
+  // random turn
+  if (random(0, 2) == 0) drive(-turn, turn);
+  else                   drive(turn, -turn);
+  delay(260);
+
+  // after this, next loop will pick movement again
+  moveUntil = millis(); // force immediate re-pick
+}
+
 void startRinging(DateTime now) {
   state = RINGING;
   buzzerOff();
@@ -229,7 +251,7 @@ void onClkRise() {
 
 // ---------------- Button debounce + press type ----------------
 void updateButton(unsigned long ms) {
-  bool raw = digitalRead(PIN_SW); // HIGH not pressed, LOW pressed
+  bool raw = digitalRead(PIN_SW);
 
   if (raw != lastRawBtn) {
     lastRawBtn = raw;
@@ -295,8 +317,15 @@ void setup() {
   digitalWrite(STBY, HIGH);
   motorsStop();
 
+  // Ultrasonic
+  pinMode(US_TRIG, OUTPUT);
+  pinMode(US_ECHO, INPUT);
+  digitalWrite(US_TRIG, LOW);
+
   loadAlarm();
-  randomSeed(analogRead(A1));
+
+  // Use a pin that is NOT A1 (since A1 is used for echo)
+  randomSeed(analogRead(A2));
 }
 
 // ---------------- Loop ----------------
@@ -305,6 +334,13 @@ void loop() {
   updateButton(ms);
 
   DateTime now = rtc.now();
+
+  // Update distance occasionally (non-spam)
+  if (ms - lastDistMs >= 120) {
+    lastDistMs = ms;
+    float d = readDistanceCM();
+    if (d > 0) lastDistCm = d;
+  }
 
   // -------- handle encoder changes ----------
   if (state == SHOW_CLOCK || state == RINGING) encoderDelta = 0;
@@ -335,11 +371,9 @@ void loop() {
     btnDown = false;
 
     if (held >= 1000) {
-      // LONG PRESS: toggle test ring on main screen
       if (state == SHOW_CLOCK) startRinging(now);
       else if (state == RINGING) stopRinging();
     } else {
-      // SHORT PRESS: normal UI flow
       if (state == SHOW_CLOCK) state = SET_HOUR;
       else if (state == SET_HOUR) state = SET_MIN;
       else if (state == SET_MIN) {
@@ -363,40 +397,52 @@ void loop() {
     }
   }
 
-  // -------- ringing behavior ----------
+  // -------- ringing behavior + obstacle avoidance ----------
   if (state == RINGING) {
-    updateBeepPattern(ms);     // << better “ringy” beep pattern
-    if (ms > moveUntil) pickNextMove();
+    updateBeepPattern(ms);
+
+    // If obstacle close, avoid immediately
+    const float STOP_CM = 20.0; // tweak: 15-30cm
+    if (lastDistCm > 0 && lastDistCm < STOP_CM) {
+      avoidObstacle();
+    } else {
+      if (ms > moveUntil) pickNextMove();
+    }
   } else {
     buzzerOff();
     motorsStop();
   }
 
-  // -------- OLED draw (prettier layout) ----------
+  // -------- OLED draw (pretty layout + distance) ----------
   if (ms - lastDraw >= 200) {
     lastDraw = ms;
     display.clearDisplay();
 
-    // Big HH:MM on top
     display.setTextSize(2);
     display.setCursor(0, 0);
     print2(now.hour());
     display.print(':');
     print2(now.minute());
-    display.print(':');
-    print2(now.second());
-    // Small info line
+
     display.setTextSize(1);
     display.setCursor(0, 20);
-    display.print("  A:");
+    display.print("S:");
+    print2(now.second());
+    display.print(" A:");
     print2(alarmHour);
     display.print(':');
     print2(alarmMin);
-    display.print(alarmEnabled ? " ON " : " OFF");
 
-    // Mode label on far right-ish
-    display.setCursor(96, 20);
-    display.print(stateLabel());
+    // show distance on the right
+    display.setCursor(86, 20);
+    display.print("D:");
+    if (lastDistCm > 0) {
+      int d = (int)(lastDistCm + 0.5);
+      display.print(d);
+      display.print("cm");
+    } else {
+      display.print("--");
+    }
 
     display.display();
   }
